@@ -6,6 +6,9 @@ all: pylint
 bip39-en.txt:
 	wget -O $(@) "https://raw.githubusercontent.com/bitcoin/bips/master/bip-0039/english.txt"
 
+bip39-vectors.json:
+	wget -O $(@) "https://raw.githubusercontent.com/trezor/python-mnemonic/master/vectors.json"
+
 pylint: $(PYLINT3)
 
 .%.pylint3: %.py
