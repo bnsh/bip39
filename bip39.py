@@ -16,6 +16,7 @@
 
 import os
 import random
+from hmac import HMAC
 import hashlib
 import argparse
 from functools import reduce
@@ -41,6 +42,9 @@ def compute_sha256(values: bytes) -> str:
     s256 = hashlib.sha256()
     s256.update(values)
     return s256.hexdigest()
+
+def compute_hmac_sha512(values: bytes) -> bytes:
+    return HMAC("Bitcoin seed".encode("utf-8"), values, hashlib.sha512).hexdigest()
 
 def consume_multiple_of_11_bits(bucket_of_11_or_more_bits: list[int], emitted_indices: list[int]) -> None:
     while len(bucket_of_11_or_more_bits) >= 11:
@@ -99,7 +103,7 @@ def entropy2mnemonic(values: bytes) -> list[str]:
     # 8 * 32 = 256
 
     for bits, bitsz in [(byte, 8) for byte in values] + [(checksum_bip, 8*len(values)//32)]:
-        if len(bucket_of_11_or_more_bits) >= 11: # If we have accumulated _more_ than 11 bits:
+        while len(bucket_of_11_or_more_bits) >= 11: # If we have accumulated _more_ than 11 bits:
             consume_multiple_of_11_bits(bucket_of_11_or_more_bits, emitted_indices)
 
         # range(bitsz-1, -1, -1) because we need to append these in reversed order.
@@ -114,12 +118,14 @@ def entropy2mnemonic(values: bytes) -> list[str]:
     vocabulary = grab_vocabulary(localfile("bip39-en.txt"))
     return [vocabulary[idx] for idx in emitted_indices]
 
-def mnemonic2entropy(*, mnemonic: str) -> bytes:
+#pylint: disable=too-many-locals
+def trust_but_verify(*, mnemonic: str) -> bytes:
     # This function will convert to a (ENT, CS) pair and verify that the checksum is valid for
     # the _purported_ ENT. If it is not, it throws a ValueError
     # Our mnemonic consists of n words of 11 bits each.
     # So, we will have n * 11 bits
     # We'll need to verify that n is multiple of 3 (Because, our "checksum" is of size len(ent)//32 # len(ent) is in _bits_
+    # https://en.wikipedia.org/wiki/Trust,_but_verify
     assert mnemonic is not None
     mnemonic_list = mnemonic.split(" ")
     idx2word = grab_vocabulary(localfile("bip39-en.txt"))
@@ -137,6 +143,28 @@ def mnemonic2entropy(*, mnemonic: str) -> bytes:
     ent_plus_cs = reduce(lambda acc, x: acc * (2 ** 11) + x, ent_plus_cs_arr, 0)
 
     # Now we need to extract this into an ent and cs portions separately.
+    csmask = sum(2 ** idx for idx in range(0, cs_sz))
+    csonly = ent_plus_cs & csmask
+    entonly = ent_plus_cs >> cs_sz
+    entbytes = []
+    entonly_sofar = entonly
+    for idx in range(0, ent_sz // 8):
+        entbytes.append(entonly_sofar & 0x00ff)
+        entonly_sofar >>= 8
+    entbytes = bytes(reversed(entbytes))
+    cksum = int(compute_sha256(entbytes), 16)
+
+    # We need the first cs_sz bits from cksum
+    cstbv = cksum >> (256-cs_sz)
+    if cstbv != csonly:
+        print(f"Oh no! The checksum is not valid! I expected 0x{cstbv:x}, but I found 0x{csonly:x}..")
+        print(entbytes.hex())
+        print(cs_sz)
+        print(mnemonic)
+
+    return entbytes
+#pylint: enable=too-many-locals
+
 
 def mnemonic2derived_seed(*, mnemonic: str, passphrase: str) -> str:
     # https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki
@@ -145,6 +173,8 @@ def mnemonic2derived_seed(*, mnemonic: str, passphrase: str) -> str:
     # The iteration count is set to 2048 and HMAC-SHA512 is used as the pseudo-random function.
     # The length of the derived key is 512 bits (= 64 bytes).
 
+    trust_but_verify(mnemonic=mnemonic)
+
     pbkdfpassword = mnemonic.encode("utf-8")
     salt = ("mnemonic" + passphrase).encode("utf-8")
     iteration_count = 2048
@@ -152,6 +182,43 @@ def mnemonic2derived_seed(*, mnemonic: str, passphrase: str) -> str:
     derived_key = hashlib.pbkdf2_hmac("sha512", pbkdfpassword, salt, iteration_count, dklen=key_length)
 
     return derived_key.hex()
+
+def derived_seed2prvkey(*, derived_seed: str) -> str:
+    derived_bytes = bytes.fromhex(derived_seed)
+    hmacsha512 = compute_hmac_sha512(derived_bytes)
+    i_l = hmacsha512[0:64]
+    i_r = hmacsha512[64:128]
+    keyhex = (
+        "0488ade4" +    #  32 bits: A fixed prefix (0x0488ADE4 for mainnet private keys),
+        "00" +          #   8 bits: Depth (0x00 for master keys),
+        "00000000" +    #  32 bits: Parent fingerprint (0x00000000 for master keys),
+        "00000000" +    #  32 bits: Child number (0x00000000 for master keys),
+        i_r +           # 256 bits: The chain code (I_R)
+        "00" +          #   8 bits: a prefix of 0x00
+        i_l             # 256 bits: The private key (I_L)
+    )
+                        # 624 bits? + 32 bits for checksum
+# How many base58 digits are 656 bits?
+# bits in x (arbitrary integer) =
+#   Log[x] / Log[2]
+# digits in base58 in x
+#   Log[x] / Log[58]
+# So.. 656 bits * Log[2] / Log[58] = 111.9839
+# Round up to 112
+    keybytes = bytes.fromhex(keyhex)
+    sha256bytes = bytes.fromhex(compute_sha256(keybytes))
+    doublesha256bytes = bytes.fromhex(compute_sha256(sha256bytes))
+    key_with_checksum_bytes = keybytes + doublesha256bytes[0:4]
+    key_as_int = int(key_with_checksum_bytes.hex(), 16)
+    base58digits = []
+    keyrem = key_as_int
+    while keyrem > 0:
+        base58digits.append(keyrem % 58)
+        keyrem = keyrem // 58
+
+    base58digits = reversed([0] * (111-len(base58digits)) + base58digits)
+    base58alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    return "".join(base58alphabet[val] for val in base58digits)
 
 def main():
     parser = argparse.ArgumentParser()
